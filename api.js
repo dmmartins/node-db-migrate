@@ -457,4 +457,462 @@ dbmigrate.prototype = {
   }
 };
 
+function createMigrationDir(dir, callback) {
+  fs.stat(dir, function(err) {
+    if (err) {
+      mkdirp(dir, callback);
+    } else {
+      callback();
+    }
+  });
+}
+
+function loadConfig( config, internals ) {
+  var out,
+      currentEnv = internals.currentEnv || internals.argv.env;
+
+  if (internals.configObject) {
+    out = config.loadObject(internals.configObject, currentEnv);
+  } else {
+    out = config.loadFile(internals.argv.config, currentEnv, internals.plugins);
+  }
+  if (internals.verbose) {
+    var current = out.getCurrent();
+    var s = JSON.parse(JSON.stringify(current.settings));
+
+    if (s.password)
+      s.password = '******';
+
+    log.info('Using', current.env, 'settings:', s);
+  }
+
+  return out;
+}
+
+function executeCreateMigration(internals, config, callback) {
+
+  var migrationsDir = internals.argv['migrations-dir'];
+
+  internals.runTimestamp = new Date();
+
+  if (internals.migrationMode && internals.migrationMode !== 'all') {
+
+    migrationsDir = internals.argv['migrations-dir'] + '/' +
+      internals.migrationMode;
+  }
+
+  var folder, path;
+
+  if (internals.argv._.length === 0) {
+    log.error('\'migrationName\' is required.');
+    optimist.showHelp();
+    process.exit(1);
+  }
+
+  createMigrationDir(migrationsDir, function(err) {
+
+    var index = require('./connect');
+    var Migration = require('./lib/migration.js');
+
+    if (err) {
+      log.error('Failed to create migration directory at ', migrationsDir,
+        err);
+      process.exit(1);
+    }
+
+    internals.argv.title = internals.argv._.shift();
+    folder = internals.argv.title.split('/');
+
+    internals.argv.title = folder[folder.length - 2] || folder[0];
+    path = migrationsDir;
+
+    if (folder.length > 1) {
+
+      path += '/';
+
+      for (var i = 0; i < folder.length - 1; ++i) {
+
+        path += folder[i] + '/';
+      }
+    }
+
+    var templateType = Migration.TemplateType.DEFAULT_JS;
+    if (shouldCreateSqlFiles( internals, config ) &&
+        shouldCreateCoffeeFile( internals, config )) {
+
+      templateType = Migration.TemplateType.COFFEE_SQL_FILE_LOADER;
+    } else if (shouldCreateSqlFiles( internals, config ) &&
+               shouldIgnoreOnInitFiles( internals, config )) {
+
+      templateType = Migration.TemplateType.SQL_FILE_LOADER_IGNORE_ON_INIT;
+    } else if (shouldCreateSqlFiles( internals, config )) {
+
+      templateType = Migration.TemplateType.SQL_FILE_LOADER;
+    } else if (shouldCreateCoffeeFile( internals, config )) {
+
+      templateType = Migration.TemplateType.DEFAULT_COFFEE;
+    }
+    var migration = new Migration(internals.argv.title + (
+        shouldCreateCoffeeFile( internals, config ) ? '.coffee' : '.js'), path, internals.runTimestamp,
+      templateType);
+    index.createMigration(migration, function(err, migration) {
+      if (_assert(err, callback)) {
+
+        log.info(util.format('Created migration at %s', migration.path));
+        if (shouldCreateSqlFiles(internals, config)) {
+          createSqlFiles(internals, config, callback);
+        } else {
+          if (typeof(callback) === 'function') {
+            callback();
+          }
+        }
+      }
+    });
+  });
+}
+
+function shouldCreateSqlFiles( internals, config ) {
+  return internals.argv['sql-file'] || config['sql-file'];
+}
+
+function shouldIgnoreOnInitFiles( internals, config ) {
+  return internals.argv['ignore-on-init'] || config[
+    'ignore-on-init'];
+}
+
+function shouldCreateCoffeeFile( internals, config ) {
+  return internals.argv['coffee-file'] || config['coffee-file'];
+}
+
+function createSqlFiles(internals, config, callback) {
+
+  var migrationsDir = internals.argv['migrations-dir'];
+
+  if (internals.migrationMode && internals.migrationMode !== 'all') {
+
+    migrationsDir = internals.argv['migrations-dir'] + '/' +
+      internals.migrationMode;
+  }
+
+  var sqlDir = migrationsDir + '/sqls';
+  createMigrationDir(sqlDir, function(err) {
+
+    var index = require('./connect');
+    var Migration = require('./lib/migration.js');
+
+    if (err) {
+      log.error('Failed to create migration directory at ', sqlDir, err);
+
+      if (typeof(callback) !== 'function') {
+
+        process.exit(1);
+      } else {
+
+        return callback(err);
+      }
+    }
+
+    var templateTypeDefaultSQL = Migration.TemplateType.DEFAULT_SQL;
+    var migrationUpSQL = new Migration(internals.argv.title + '-up.sql',
+      sqlDir, internals.runTimestamp, templateTypeDefaultSQL);
+    index.createMigration(migrationUpSQL, function(err, migration) {
+      if (_assert(err, callback)) {
+
+        log.info(util.format('Created migration up sql file at %s',
+          migration.path));
+
+        var migrationDownSQL = new Migration(internals.argv.title +
+          '-down.sql', sqlDir, internals.runTimestamp, templateTypeDefaultSQL);
+        index.createMigration(migrationDownSQL, function(err, migration) {
+          if (_assert(err, callback)) {
+
+            log.info(util.format(
+              'Created migration down sql file at %s',
+              migration.path));
+            if (typeof(callback) === 'function')
+              callback();
+          }
+        });
+      }
+    });
+  });
+}
+
+function _assert(err, callback) {
+  if (err) {
+
+    if (typeof(callback) === 'function') {
+
+      callback(err);
+      return false;
+    } else {
+
+      assert.ifError(err);
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function migrationHook(internals) {
+
+  var Migration = require('./lib/migration.js');
+  return Migration.registerHook(internals.plugins, internals);
+}
+
+function executeDB(internals, config, callback) {
+
+  var index = require('./connect');
+  var settings = config.getCurrent().settings;
+  internals.argv.dbname = settings.database;
+  delete settings.database;
+
+  if (internals.argv.dbname === undefined) {
+    log.info('Error: You must set a database name!');
+    return;
+  }
+
+  index.driver(settings, function(err, db) {
+    assert.ifError(err);
+
+    if (internals.mode === 'create') {
+      db.createDatabase(internals.argv.dbname, {
+        ifNotExists: true
+      }, function(err) {
+        if (err) {
+          if( err.error )
+            err = err.error;
+          log.info('Error: Failed to create database!', err);
+        } else {
+          log.info('Created database "' + internals.argv.dbname + '"');
+        }
+
+        db.close();
+        if( typeof(callback) === 'function' )
+          callback();
+      });
+    } else if (internals.mode === 'drop') {
+      db.dropDatabase(internals.argv.dbname, {
+        ifExists: true
+      }, function(err) {
+        if (err) {
+          if( err.error )
+            err = err.error;
+          log.info('Error: Failed to drop database!', err);
+        } else {
+          log.info('Deleted database "' + internals.argv.dbname + '"');
+        }
+
+        db.close();
+        if( typeof(callback) === 'function' )
+          callback();
+      });
+    } else
+      return;
+  });
+
+}
+
+function executeSeed(internals, config, callback) {
+
+  var index = require('./connect');
+  var Seeder = require('./lib/seeder.js');
+
+  if (internals.argv._.length > 0) {
+    internals.argv.destination = internals.argv._.shift().toString();
+  }
+
+  index.connect({
+    config: config.getCurrent().settings,
+    internals: internals
+  }, Seeder, function(err, seeder) {
+    assert.ifError(err);
+
+    seeder.seedDir = path.resolve(internals.argv[(internals.mode !==
+      'static') ? 'vcseeder-dir' : 'staticseeder-dir']);
+
+    if (internals.mode === 'static') {
+
+      seeder.seed(internals.argv, internals.onComplete.bind(this, seeder,
+        internals, callback));
+    } else {
+      seeder.createSeedsTable(function(err) {
+        if (_assert(err, callback)) {
+
+          seeder.seed(internals.argv, internals.onComplete.bind(this,
+            seeder, internals, callback));
+        }
+      });
+    }
+  });
+}
+
+function executeUndoSeed(internals, config, callback) {
+
+  var index = require('./connect');
+  var Seeder = require('./lib/seeder.js');
+
+  if (!internals.argv.count) {
+    log.info('Defaulting to running 1 down seed.');
+    internals.argv.count = 1;
+  }
+
+  if (internals.argv._.length > 0) {
+    internals.argv.destination = internals.argv._.shift().toString();
+  }
+
+  index.connect({
+    config: config.getCurrent().settings,
+    internals: internals
+  }, Seeder, function(err, seeder) {
+    assert.ifError(err);
+
+    seeder.seedDir = path.resolve(internals.argv[(internals.mode !==
+      'static') ? 'vcseeder-dir' : 'staticseeder-dir']);
+
+    if (internals.mode === 'static') {
+
+      internals.onComplete( seeder, callback,
+        { stack: 'Static seeders can\'t be undone. Use VC Seeders instead!' } );
+    } else {
+      seeder.createSeedsTable(function(err) {
+        if (_assert(err, callback)) {
+
+          seeder.down(internals.argv, internals.onComplete.bind(this,
+            seeder, internals, callback));
+        }
+      });
+    }
+  });
+}
+
+function transition(internals) {
+
+  require('./lib/transitions/transitioner.js')(internals);
+}
+
+function run(internals, config) {
+  var action = internals.argv._.shift(),
+    folder = action.split(':');
+
+  action = folder[0];
+
+  switch (action) {
+    case 'transition':
+
+      transition(internals);
+      break;
+    case 'create':
+
+      if (folder[1]) {
+        internals.matching = folder[1];
+        internals.migrationMode = folder[1];
+      }
+      executeCreateMigration(internals, config);
+      break;
+    case 'sync':
+
+      var executeSync = require('./lib/commands/sync.js');
+
+      if (internals.argv._.length === 0) {
+
+        log.error('Missing sync destination!');
+        process.exit(1);
+      }
+
+      internals.argv.count = Number.MAX_VALUE;
+      internals.argv.destination = internals.argv._.shift().toString();
+
+      if (folder[1]) {
+        internals.matching = folder[1];
+        internals.migrationMode = folder[1];
+      }
+
+      executeSync(internals, config);
+      break;
+    case 'up':
+    case 'down':
+    case 'reset':
+
+      if (action === 'reset')
+        internals.argv.count = Number.MAX_VALUE;
+
+      if (internals.argv._.length > 0) {
+        if (action === 'down') {
+
+          internals.argv.count = internals.argv.count || Number.MAX_VALUE;
+          internals.argv.destination = internals.argv._.shift().toString();
+        } else {
+          internals.argv.destination = internals.argv._.shift().toString();
+        }
+      }
+
+      if (folder[1]) {
+        internals.matching = folder[1];
+        internals.migrationMode = folder[1];
+      }
+
+      if (action === 'up') {
+
+        var executeUp = require('./lib/commands/up.js');
+        executeUp(internals, config);
+      } else {
+
+        var executeDown = require('./lib/commands/down.js');
+        executeDown(internals, config);
+      }
+      break;
+
+    case 'db':
+
+      if (folder.length < 1) {
+
+        log.info('Please enter a valid command, i.e. db:create|db:drop');
+      } else {
+
+        internals.mode = folder[1];
+        executeDB(internals, config);
+      }
+      break;
+    case 'seed':
+
+      internals.mode = folder[1] || 'vc';
+      internals.migrationMode = folder[2];
+
+      if (internals.argv._[0] === 'down' || internals.argv._[0] === 'reset') {
+
+        if (internals.argv._[0] === 'reset')
+          internals.argv.count = Number.MAX_VALUE;
+
+        internals.argv._.shift();
+        executeUndoSeed(internals, config);
+      } else {
+
+        executeSeed(internals, config);
+      }
+      break;
+
+    default:
+      var plugins = internals.plugins;
+      var plugin = plugins.overwrite(
+        'run:default:action:' + action + ':overwrite'
+      );
+      if(plugin) {
+
+        plugin['run:default:action:' + action + ':overwrite']
+          (internals, config);
+      }
+      else {
+
+        log.error('Invalid Action: Must be [up|down|create|reset|sync|' +
+          'db|transition].');
+        optimist.showHelp();
+        process.exit(1);
+      }
+      break;
+  }
+}
+
+
 module.exports = dbmigrate;
